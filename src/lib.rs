@@ -1,6 +1,4 @@
-use std::{ops::Index, vec};
-
-use proc_macro::{Delimiter, Ident, Punct, TokenStream, TokenTree};
+use proc_macro::{Delimiter, Ident, Punct, Spacing, TokenStream, TokenTree};
 
 #[proc_macro]
 pub fn sql(input: TokenStream) -> TokenStream {
@@ -11,19 +9,17 @@ fn is_comma(tree: &TokenTree) -> bool {
     matches!(tree, TokenTree::Punct(p) if p.eq(&':'))
 }
 
-fn parse_select(input: &mut [TokenTree]) -> (&[TokenTree], Select) {
-    let select_return = match input {
-        // [TokenTree::Punct(p1), TokenTree::Punct(p2), TokenTree::Ident(typename), ..]
-        //     if p1.eq(&'.') && p2.eq(&'.') =>
-        // {
-        //     Select {
-        //         ret_handler: SelectReturn::Spread(typename.clone()),
-        //         tables: vec![TokenTree::Punct(Punct::new(
-        //             '*',
-        //             proc_macro::Spacing::Alone,
-        //         ))],
-        //     }
-        // }
+fn parse_select(input: Box<[TokenTree]>) -> Select {
+    match &*input {
+        [TokenTree::Punct(p1), TokenTree::Punct(p2), TokenTree::Ident(typename)]
+            if p1.eq(&'.') && p2.eq(&'.') =>
+        {
+            Select {
+                columns: vec![TokenTree::Punct(Punct::new('*', Spacing::Alone))],
+                return_parser: ReturnParser::Spread(typename.clone()),
+            }
+        }
+
         [TokenTree::Ident(typename), TokenTree::Group(mappings)]
             if mappings.delimiter() == Delimiter::Brace =>
         {
@@ -32,54 +28,79 @@ fn parse_select(input: &mut [TokenTree]) -> (&[TokenTree], Select) {
                 Many(&'a [TokenTree]),
             }
 
-            let (fields, columns) = mappings
-                .stream()
-                .into_iter()
-                .collect::<Vec<TokenTree>>()
+            let tokens = mappings.stream().into_iter().collect::<Vec<TokenTree>>();
+
+            let (fields, columns) = tokens
                 .split(is_comma)
                 .map(|column_def| match column_def {
+                    [TokenTree::Ident(field)] => (field.clone(), &column_def[..1]),
                     [TokenTree::Ident(field), TokenTree::Punct(p), col @ ..] if p.eq(&':') => {
-                        (field.clone(), Rest::Many(col))
+                        (field.clone(), col)
                     }
-                    [TokenTree::Ident(field)] => (field.clone(), Rest::One(field.clone())),
                 })
-                .unzip::<Ident, Rest, Vec<_>, Vec<_>>();
+                .unzip::<Ident, &[TokenTree], Vec<_>, Vec<_>>();
 
             Select {
-                ret_handler: SelectReturn::Explicit(typename.clone(), fields),
-                columns: columns
-                    .into_iter()
-                    .map(|column| match column {
-                        Rest::One(col_name) => vec![TokenTree::Ident(col_name)].into_iter(),
-                        Rest::Many(expression) => expression.to_vec().into_iter(),
-                    })
-                    .intersperse(TokenTree::Punct(Punct::new(',', Spacing::Alone)))
-                    .flatten()
-                    .collect(),
+                columns: {
+                    let mut columns_tokens = Vec::<TokenTree>::with_capacity(columns.len() * 2 - 1);
+                    columns.into_iter().for_each(|col| {
+                        columns_tokens.extend(col.into_iter().cloned());
+                        columns_tokens.push(TokenTree::Punct(Punct::new(',', Spacing::Alone)))
+                    });
+                    columns_tokens.pop();
+                    columns_tokens
+                },
+                return_parser: ReturnParser::Explicit {
+                    typename: typename.clone(),
+                    fields,
+                },
             }
         }
 
-        _ => SelectReturn::Anonymous(
-            input
+        _ => {
+            let (targets, columns) = input
                 .split(is_comma)
-                .map(|column_def| match column_def {
-                    [.., TokenTree::Punct(p), TokenTree::Ident(typename)] if p.eq(&':') => {
-                        typename.clone()
+                .map(|column_def| match *column_def {
+                    [TokenTree::Ident(name), TokenTree::Punct(p), TokenTree::Ident(typename)]
+                    if p.eq(&':') =>
+                    {
+                        (ColumnTarget { name , typename }, &column_def[..1])
+                    }
+                    [TokenTree::Ident(name), TokenTree::Punct(p), TokenTree::Ident(typename), TokenTree::Punct(at), ref def @ ..] if p.eq(&':') && at.eq(&'@') => {
+                        (ColumnTarget { name, typename }, def)
                     }
                 })
-                .collect(),
-        ),
-    };
-    return (&[], select_return);
+                .unzip::<ColumnTarget, &[TokenTree], Vec<_>, Vec<_>>();
+            Select {
+                columns: columns.into_iter().flatten().cloned().collect(),
+                return_parser: ReturnParser::Anonymous(targets),
+            }
+        }
+    }
 }
 
 struct Select {
-    ret_handler: SelectReturn,
     columns: Vec<TokenTree>,
+    return_parser: ReturnParser,
 }
 
-enum SelectReturn {
+struct ColumnTarget {
+    name: Ident,
+    typename: Ident,
+}
+
+enum ReturnParser {
     Spread(Ident),
-    Explicit(Ident, Vec<Ident>),
-    Anonymous(Vec<Ident>),
+    Explicit { typename: Ident, fields: Vec<Ident> },
+    Anonymous(Vec<ColumnTarget>),
+}
+
+fn dupa() {
+    let mut a: Vec<Vec<usize>> = vec![vec![], vec![], vec![]];
+
+    match &mut *a {
+        [v, ..] => v[0],
+        [] => 1,
+        _ => 1,
+    };
 }
