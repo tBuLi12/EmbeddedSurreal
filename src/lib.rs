@@ -1,57 +1,59 @@
-use proc_macro::{Delimiter, Ident, Punct, Spacing, Span, TokenStream, TokenTree};
+use proc_macro::TokenStream;
+use quote::quote;
+
 mod select;
+mod variables;
+use variables::table_id;
 
 #[proc_macro]
 pub fn sql(input: TokenStream) -> TokenStream {
-    let tokens = input.into_iter().collect::<Vec<_>>();
-    match &tokens[..] {
-        [TokenTree::Ident(select), rest @ ..] if select.to_string() == "SELECT" => {
-            let mut rest = rest
-                .split(|tree| matches!(tree, TokenTree::Ident(from) if from.to_string() == "FROM"));
-            match (rest.next(), rest.next()) {
-                (Some(columns), Some(tables)) => {
-                    parse_select(columns);
-                    let mut vars = Variables::new();
-                }
-                _ => (),
-            }
-        }
-        _ => (),
+    let mut tokens = proc_macro2::TokenStream::from(input)
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let result_parser = match select::parse(&mut tokens) {
+        Err(err) => return err.into(),
+        Ok(parser) => parser,
     };
-    TokenStream::new()
-}
 
-struct Variables {
-    values: Vec<TokenStream>,
-    last_id: usize,
-}
+    let mut vars = variables::Variables::new();
 
-impl Variables {
-    fn new() -> Variables {
-        Variables {
-            values: Vec::new(),
-            last_id: 0,
+    vars.replace_table_ids(&mut tokens);
+    vars.replace_variables(&mut tokens);
+
+    table_id::escape_table_ids(&mut tokens);
+
+    let query_text = proc_macro2::TokenStream::from_iter(tokens)
+        .to_string()
+        .replace("__rsql__var", "$v")
+        .replace(" __rsql__colon ", ":");
+
+    let var_tokens = vars.get_tokens();
+    let query_call_tokens = quote!(db.query(#query_text, #var_tokens));
+
+    match result_parser {
+        Some(select::Select::Spread(typename)) => {
+            quote!(#query_call_tokens.map(serde_json::from_value::<Vec::<#typename>>))
         }
+        Some(select::Select::Anonymous(columns)) => {
+            let names = columns.iter().map(|col| col.name);
+            let types = columns.iter().map(|col| col.typename);
+            quote!({
+                #[derive(serde::Deserialize)]
+                struct QueryReturn {
+                    #(#names: #types),*
+                }
+                #query_call_tokens.map(serde_json::from_value::<Vec::<QueryReturn>>)
+            })
+        }
+        Some(select::Select::Explicit { fields, typename }) => {
+            quote!(#query_call_tokens.map(serde_json::from_value::<Vec::<QueryReturn>>))
+        }
+        None => query_call_tokens,
     }
+    .into()
 
-    // fn create(&mut self, value: &[TokenTree]) -> Ident {
-    //     self.values.push(value);
-    //     self.last_id += 1;
-    //     Ident::new(&format!("v{}", self.last_id), Span::call_site())
-    // }
-
-    // fn replace_table_ids(&mut self, query: &mut [TokenTree]) -> impl Iterator<Item = TokenTree> {
-    //     query
-    //         .windows(3)
-    //         .enumerate()
-    //         .filter_map(|(i, tokens)| match tokens {
-    //             [TokenTree::Ident(table), TokenTree::Punct(colon), TokenTree::Group(id_expr)]
-    //                 if colon.as_char() == ':' =>
-    //             {
-    //                 Some((i, self.create(i)))
-    //             }
-    //             _ => None,
-    //         });
-    //     ()
-    // }
+    // quote!(db.query(#query_text, #var_tokens)).into()
+    // let toks = quote!(db.query(#query_text, #var_tokens)).to_string();
+    // quote!(println!("{}", #toks)).into()
 }
